@@ -1,0 +1,11 @@
+# gerados no build (GitHub Actions)
+Radar.xcodeproj/
+App/Info.plist
+build/
+build-tf/
+Payload/
+*.ipa
+xcodebuild.log
+archive.log
+export.log
+.DS_Store

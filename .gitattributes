@@ -1,0 +1,3 @@
+# LF sempre (os scripts rodam no macOS do GitHub Actions)
+* text=auto eol=lf
+*.png binary

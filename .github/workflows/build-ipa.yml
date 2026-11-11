@@ -1,0 +1,136 @@
+name: Gerar IPA
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write        # para publicar o IPA em Releases
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Escolher o Xcode mais novo
+        run: |
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Gerar o projeto (XcodeGen)
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Compilar
+        run: |
+          set -o pipefail
+          xcodebuild -project Radar.xcodeproj -scheme Radar \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee xcodebuild.log | grep -E "error:|warning: .*deprecated|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" xcodebuild.log
+
+      - name: Empacotar o IPA (assinatura provisória)
+        run: |
+          APP=build/Build/Products/Release-iphoneos/Radar.app
+          ls "$APP"
+          codesign --force --sign - "$APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Radar.ipa Payload
+          ls -la Radar.ipa
+
+      - name: Publicar o IPA em Releases (link direto)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Radar · build ${{ github.run_number }}
+          body: |
+            Commit ${{ github.sha }}
+            Link fixo para a versão mais nova:
+            https://github.com/${{ github.repository }}/releases/latest/download/Radar.ipa
+          files: Radar.ipa
+          make_latest: true
+
+      - name: Link do IPA
+        run: |
+          echo "### Radar.ipa" >> $GITHUB_STEP_SUMMARY
+          echo "Desta build: https://github.com/${{ github.repository }}/releases/download/build-${{ github.run_number }}/Radar.ipa" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Sempre a mais nova: https://github.com/${{ github.repository }}/releases/latest/download/Radar.ipa" >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Radar-ipa
+          path: Radar.ipa
+
+      # TestFlight: só roda com os 4 segredos do repositório (Settings › Secrets and variables › Actions):
+      #   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (o conteúdo do .p8 da chave da API do App Store Connect)
+      #   e APPLE_TEAM_ID. Os mesmos do nfios e do hlios. Assinatura gerenciada pela Apple: nenhum certificado no runner.
+      #   O número da build é o número desta execução do Actions (sempre maior que o anterior, como o TestFlight exige).
+      - name: Enviar ao TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BUILD: ${{ github.run_number }}
+        run: |
+          if [ -z "$ASC_KEY_ID" ] || [ -z "$ASC_ISSUER_ID" ] || [ -z "$ASC_KEY_P8" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            echo "Sem os segredos do App Store Connect: pulei o TestFlight."
+            exit 0
+          fi
+          set -o pipefail
+          K="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$K"
+          AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$K" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          xcodebuild -project Radar.xcodeproj -scheme Radar -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath build-tf -archivePath build-tf/Radar.xcarchive \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CURRENT_PROJECT_VERSION="$BUILD" \
+            archive 2>&1 | tee archive.log | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" || true
+          grep -q "ARCHIVE SUCCEEDED" archive.log
+          codesign --force --sign - build-tf/Radar.xcarchive/Products/Applications/Radar.app
+          cat > "$RUNNER_TEMP/export.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>testFlightInternalTestingOnly</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>uploadSymbols</key><false/>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive -archivePath build-tf/Radar.xcarchive -exportPath build-tf/export \
+            -exportOptionsPlist "$RUNNER_TEMP/export.plist" "${AUTH[@]}" 2>&1 | tee export.log
+          grep -qE "EXPORT SUCCEEDED|Upload succeeded|Uploaded" export.log
+          rm -f "$K"
+          echo "### TestFlight" >> $GITHUB_STEP_SUMMARY
+          echo "Build $BUILD enviada. Em ~10 a 20 min aparece no app TestFlight do iPhone." >> $GITHUB_STEP_SUMMARY
+
+      - name: Resumo dos erros (se falhar)
+        if: failure()
+        run: |
+          grep -n "error:" xcodebuild.log | head -80 || true
+          [ -f archive.log ] && grep -n "error:" archive.log | head -40 || true
+          [ -f export.log ] && grep -niE "error|failed|ITMS-" export.log | head -60 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
